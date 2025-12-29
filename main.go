@@ -32,6 +32,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	IsChirpyRed bool `json:"is_chirpy_red"`
 }
 
 // Chirp struct for JSON responses
@@ -141,8 +142,6 @@ func main(){
 	//login endpoint
 	mux.HandleFunc("POST /api/login",apiCfg.handleLogin)
 	
-	//refresh token endpoint
-	mux.HandleFunc("POST /api/refresh",apiCfg.handleRefresh)
 	
 	//revoke token endpoint
 	mux.HandleFunc("POST /api/revoke",apiCfg.handleRevoke)
@@ -159,6 +158,16 @@ func main(){
 
 	////update user endpoint
 	mux.HandleFunc("PUT /api/users",apiCfg.handleUpdateUser)
+	
+	
+	//refreshtoken endpoint
+	mux.HandleFunc("POST /api/refresh",apiCfg.handleRefresh)
+	
+	//webhook
+	mux.HandleFunc("POST /api/polka/webhooks",apiCfg.handlePolkaWebhook)
+
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handleDeleteChirp)
+	
 	
 	server :=&http.Server{
 		Addr: ":8080",
@@ -279,6 +288,7 @@ func (cfg *apiConfig) handleUsers(w http.ResponseWriter,r *http.Request){
 		CreatedAt: dbUser.CreatedAt,
 		UpdatedAt: dbUser.UpdatedAt,
 		Email:     dbUser.Email,
+		IsChirpyRed: dbUser.IsChirpyRed,
 	}
 
 	//return user with 201 created status
@@ -298,6 +308,7 @@ func (cfg *apiConfig) handleLogin(w http.ResponseWriter,r *http.Request){
         Email        string    `json:"email"`
         Token        string    `json:"token"`
         RefreshToken string    `json:"refresh_token"`
+		IsChirpyRed bool       `json:"is_chirpy_red"`
     }
 
 	decoder :=json.NewDecoder(r.Body)
@@ -390,6 +401,7 @@ func (cfg *apiConfig) handleLogin(w http.ResponseWriter,r *http.Request){
 		Email:        dbUser.Email,
 		Token:        token,
 		RefreshToken: refreshToken,
+		IsChirpyRed: dbUser.IsChirpyRed,
 	}
 
 	respondWithJSON(w,http.StatusOK,user)
@@ -666,6 +678,113 @@ user:=User{
 	CreatedAt: dbUser.CreatedAt,
 	UpdatedAt: dbUser.UpdatedAt,
 	Email: dbUser.Email,
+	IsChirpyRed: dbUser.IsChirpyRed,
 }
 respondWithJSON(w,http.StatusOK,user)
+}
+
+
+func (cfg *apiConfig) handleDeleteChirp(w http.ResponseWriter,r *http.Request){
+	//extract and validate token
+	token,err:=auth.GetBearerToken(r.Header)
+	if err !=nil{
+		respondWithError(w,http.StatusUnauthorized,"Missing or invalid authorization header")
+		return
+	}
+
+	//validate the JWT AND GET THE user ID
+	userID,err:=auth.ValidateJWT(token,cfg.jwtSecret)
+	if err!=nil{
+		respondWithError(w,http.StatusUnauthorized,"Invalid or expiredtoken")
+		return
+	}
+
+	//extract chirpID from the url
+	chirpIDStr :=r.PathValue("chirpID")
+	if chirpIDStr ==""{
+		respondWithError(w,http.StatusBadRequest,"Chirp ID is required")
+        return
+	}
+
+	//parse chirpID to UUID
+	chirpID,err :=uuid.Parse(chirpIDStr)
+	if err !=nil{
+		respondWithError(w,http.StatusBadRequest,"Invalid chirp ID format")
+		return
+	}
+
+	//get the chirp from the database to check ownership
+	dbChirp,err :=cfg.db.GetChirp(r.Context(),chirpID)
+	if err !=nil{
+		if err ==sql.ErrNoRows{
+			respondWithError(w,http.StatusNotFound,"Chirp not found")
+			return
+		}
+		log.Printf("Error getting chirp: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chirp")
+		return
+	}
+
+	// check if the authenticated user is the author 
+     if dbChirp.UserID !=userID{
+		respondWithError(w,http.StatusForbidden,"You are not authorized to delete this chirp")
+		return
+	 }
+
+
+	// delete the chirp 
+	err = cfg.db.DeleteChirp(r.Context(),chirpID)
+	if err !=nil{
+		log.Printf("Error deleting chirp: %v",err)
+		respondWithError(w,http.StatusInternalServerError,"Failed to delete chirp")
+		return
+	}
+
+
+	//return 204 content (success no response body)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) handlePolkaWebhook(w http.ResponseWriter,r *http.Request){
+	//define the webhook request structure
+	type webhookRequest struct {
+		Event string  `json:"event"`
+		Data struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}
+
+	//parse the request body
+	decoder := json.NewDecoder(r.Body)
+	params :=webhookRequest{}
+	err :=decoder.Decode(&params)
+	if err !=nil{
+		respondWithError(w,http.StatusBadRequest,"Invalid request payload")
+		return
+	}
+
+		// Step 2: Check if the event is "user.upgraded"
+	// If it's any other event, respond with 204 and ignore it
+
+	if params.Event !="user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	//upgrade the user to chirpy red
+	err = cfg.db.UpgradeUserToChirpyRed(r.Context(),params.Data.UserID)
+	if err !=nil{
+		//check if the error is because user wasnt found 
+		if err == sql.ErrNoRows{
+			respondWithError(w,http.StatusNotFound,"User not found")
+			return
+		}
+		log.Printf("Error upgrading user to Chirpy Red: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to upgrade user")
+		return
+	}
+
+	//return 204 NO content on success
+		w.WriteHeader(http.StatusNoContent)
+
 }
